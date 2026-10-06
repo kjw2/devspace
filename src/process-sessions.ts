@@ -1,5 +1,9 @@
 import { spawn } from "node:child_process";
-import { resolveShellCommand, terminateProcessTree } from "./process-platform.js";
+import {
+  createWindowsProcessJob,
+  resolveShellCommand,
+  terminateProcessTree,
+} from "./process-platform.js";
 
 const DEFAULT_EXEC_YIELD_MS = 10_000;
 const DEFAULT_INTERACTIVE_YIELD_MS = 250;
@@ -334,16 +338,23 @@ export class ProcessSessionManager {
       detached,
       shell: shell.executable,
     });
+    const windowsJob = createWindowsProcessJob(child.pid);
 
     session.process = {
       write: (data) => child.stdin.write(data),
-      kill: (signal = "SIGTERM") => terminateProcessTree(child, signal, detached),
+      kill: (signal = "SIGTERM") => {
+        if (windowsJob?.terminate()) return;
+        terminateProcessTree(child, signal, detached);
+      },
       resize: input.tty ? () => undefined : undefined,
     };
     child.stdout.on("data", (data: Buffer) => this.append(session, data.toString("utf8")));
     child.stderr.on("data", (data: Buffer) => this.append(session, data.toString("utf8")));
     child.on("error", (error) => this.append(session, `${error.message}\n`));
-    child.on("close", (code, signal) => this.finish(session, code ?? undefined, signal ?? undefined));
+    child.on("close", (code, signal) => {
+      windowsJob?.close();
+      this.finish(session, code ?? undefined, signal ?? undefined);
+    });
   }
 
   private async startPty(session: ProcessSession, input: StartCommandInput): Promise<void> {
