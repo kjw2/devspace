@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { git, getGitEligibility, safeWorkspaceRefSegment } from "./git.js";
+import { git, getGitEligibility, GitCommandTimeoutError, safeWorkspaceRefSegment, type GitCommandOptions } from "./git.js";
 
 export type ReviewSince = "last_shown" | "workspace_open";
 
@@ -58,7 +58,11 @@ export interface ReviewCheckpointManager {
 
 const REVIEW_REF_PREFIX = "refs/devspace/review";
 
-export function createReviewCheckpointManager(): ReviewCheckpointManager {
+export function createReviewCheckpointManager(options: { initializationTimeoutMs?: number } = {}): ReviewCheckpointManager {
+  const initializationTimeoutMs = options.initializationTimeoutMs ?? 15_000;
+  if (!Number.isSafeInteger(initializationTimeoutMs) || initializationTimeoutMs <= 0) {
+    throw new RangeError("Review initializationTimeoutMs must be a positive integer");
+  }
   const states = new Map<string, WorkspaceReviewState>();
   const initializations = new Map<string, Promise<void>>();
 
@@ -78,7 +82,7 @@ export function createReviewCheckpointManager(): ReviewCheckpointManager {
         return reviewAvailability(initializedState);
       }
 
-      const initialize = initializeWorkspaceState(states, workspaceId, root);
+      const initialize = initializeWorkspaceState(states, workspaceId, root, initializationTimeoutMs);
       initializations.set(workspaceId, initialize);
       try {
         await initialize;
@@ -208,6 +212,7 @@ async function initializeWorkspaceState(
   states: Map<string, WorkspaceReviewState>,
   workspaceId: string,
   root: string,
+  timeoutMs: number,
 ): Promise<void> {
   const refs = reviewRefs(workspaceId);
   const state: WorkspaceReviewState = {
@@ -217,25 +222,26 @@ async function initializeWorkspaceState(
     baselineRefAvailable: false,
   };
 
+  const gitOptions: GitCommandOptions = { deadlineMs: Date.now() + timeoutMs };
   try {
-    const eligibility = await getGitEligibility(root);
+    const eligibility = await getGitEligibility(root, gitOptions);
     if (!eligibility.ok || !eligibility.gitRoot) {
       state.diagnostic = eligibility.message ?? "show_changes requires a Git workspace in this version.";
       return;
     }
 
     const [openCommit, baselineCommit] = await Promise.all([
-      commitForRef(eligibility.gitRoot, state.openRef),
-      commitForRef(eligibility.gitRoot, state.baselineRef),
+      commitForRef(eligibility.gitRoot, state.openRef, gitOptions),
+      commitForRef(eligibility.gitRoot, state.baselineRef, gitOptions),
     ]);
 
     if (!openCommit && !baselineCommit) {
       const head = eligibility.hasHead
-        ? (await git(eligibility.gitRoot, ["rev-parse", "--verify", "HEAD^{commit}"])).stdout.trim()
+        ? (await git(eligibility.gitRoot, ["rev-parse", "--verify", "HEAD^{commit}"], gitOptions)).stdout.trim()
         : undefined;
-      const initialCommit = await createWorkingTreeSnapshot(eligibility.gitRoot, head);
-      await git(eligibility.gitRoot, ["update-ref", state.openRef, initialCommit]);
-      await git(eligibility.gitRoot, ["update-ref", state.baselineRef, initialCommit]);
+      const initialCommit = await createWorkingTreeSnapshot(eligibility.gitRoot, head, gitOptions);
+      await git(eligibility.gitRoot, ["update-ref", state.openRef, initialCommit], gitOptions);
+      await git(eligibility.gitRoot, ["update-ref", state.baselineRef, initialCommit], gitOptions);
       state.openRefAvailable = true;
       state.baselineRefAvailable = true;
     } else {
@@ -264,10 +270,11 @@ function isReadyState(state: WorkspaceReviewState | undefined): boolean {
   return state?.gitRoot !== undefined;
 }
 
-async function commitForRef(gitRoot: string, ref: string): Promise<string | undefined> {
+async function commitForRef(gitRoot: string, ref: string, options: GitCommandOptions = {}): Promise<string | undefined> {
   try {
-    return (await git(gitRoot, ["rev-parse", "--verify", `${ref}^{commit}`])).stdout.trim();
-  } catch {
+    return (await git(gitRoot, ["rev-parse", "--verify", `${ref}^{commit}`], options)).stdout.trim();
+  } catch (error) {
+    if (error instanceof GitCommandTimeoutError) throw error;
     return undefined;
   }
 }
@@ -282,19 +289,19 @@ function reviewRefs(
   };
 }
 
-async function createWorkingTreeSnapshot(gitRoot: string, parent?: string): Promise<string> {
+async function createWorkingTreeSnapshot(gitRoot: string, parent?: string, options: GitCommandOptions = {}): Promise<string> {
   const tempDir = await mkdtemp(join(tmpdir(), "devspace-review-index-"));
   const indexPath = join(tempDir, "index");
   const env = checkpointEnv(indexPath);
 
   try {
-    await git(gitRoot, parent ? ["read-tree", parent] : ["read-tree", "--empty"], { env });
-    await git(gitRoot, ["add", "-A", "--", "."], { env });
-    const tree = (await git(gitRoot, ["write-tree"], { env })).stdout.trim();
+    await git(gitRoot, parent ? ["read-tree", parent] : ["read-tree", "--empty"], { ...options, env });
+    await git(gitRoot, ["add", "-A", "--", "."], { ...options, env });
+    const tree = (await git(gitRoot, ["write-tree"], { ...options, env })).stdout.trim();
     const commitArgs = ["commit-tree", tree];
     if (parent) commitArgs.push("-p", parent);
     commitArgs.push("-m", "DevSpace review snapshot");
-    return (await git(gitRoot, commitArgs, { env })).stdout.trim();
+    return (await git(gitRoot, commitArgs, { ...options, env })).stdout.trim();
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }

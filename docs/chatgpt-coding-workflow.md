@@ -194,6 +194,14 @@ MCP results without creating an iframe for each call. Set `ui.enabled` to
 `false` in `~/.devspace/config.jsonc` to disable UI metadata while keeping the
 aggregate review tool available.
 
+Workspace-open review initialization has a shared 15-second budget. If a slow
+Git operation or content filter exhausts it, the workspace still opens with
+`review.available: false` and a diagnostic reason. Git helper operations have a
+30-second default deadline and terminate their process tree on timeout. The
+review snapshot uses a temporary index; the checkout's index and HEAD are not
+replaced. A timeout does not imply that Core stopped or that a review baseline
+was captured successfully.
+
 Call `show_changes` exactly once after the final file modification in any turn
 that changes files. It shows the combined changes for that turn and advances
 the review point automatically. Reusing a workspace does not change this

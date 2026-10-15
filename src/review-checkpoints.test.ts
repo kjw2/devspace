@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -8,6 +8,33 @@ import { promisify } from "node:util";
 import { createReviewCheckpointManager, readReviewRef } from "./review-checkpoints.js";
 
 const execFileAsync = promisify(execFile);
+
+test("slow initial Git filters disable review within the open budget and preserve the checkout", async t => {
+  const root = await committedRepository(t);
+  const outside = await mkdtemp(join(tmpdir(), "devspace-review-slow-filter-"));
+  t.after(() => rm(outside, { recursive: true, force: true }));
+  const script = join(outside, "filter.cjs");
+  const pidPath = join(outside, "filter.pid");
+  await writeFile(script, `require('node:fs').writeFileSync(${JSON.stringify(pidPath)}, String(process.pid)); setInterval(() => {}, 1000);`);
+  const quote = (path: string) => `'${path.replaceAll("\\", "/").replaceAll("'", "'\\''")}'`;
+  await execFileAsync("git", ["config", "filter.devspace-delay.clean", `${quote(process.execPath)} ${quote(script)}`], { cwd: root });
+  await writeFile(join(root, ".gitattributes"), "*.slow filter=devspace-delay\n");
+  await writeFile(join(root, "blocked.slow"), "preserve this file\n");
+  const index = await readFile(join(root, ".git", "index"));
+  const head = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: root })).stdout;
+  const manager = createReviewCheckpointManager({ initializationTimeoutMs: 2_500 });
+  const started = Date.now();
+  const result = await manager.initializeWorkspace({ workspaceId: "ws_slow_filter", root });
+  assert.equal(result.available, false);
+  if (!result.available) assert.match(result.reason, /budget/);
+  assert.ok(Date.now() - started < 10_000);
+  assert.equal(await readFile(join(root, "blocked.slow"), "utf8"), "preserve this file\n");
+  assert.deepEqual(await readFile(join(root, ".git", "index")), index);
+  assert.equal((await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: root })).stdout, head);
+  const pid = Number(await readFile(pidPath, "utf8"));
+  assert.throws(() => process.kill(pid, 0));
+  assert.equal((await execFileAsync("git", ["for-each-ref", "refs/devspace/review/ws_slow_filter"], { cwd: root })).stdout, "");
+});
 
 test("a clean workspace reports no changes from the last-shown checkpoint", async (t) => {
   const root = await committedRepository(t);
